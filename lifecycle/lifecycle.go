@@ -7,16 +7,18 @@ import (
 	"slices"
 	"time"
 
-	"github.com/platform-mesh/subroutines"
-	subroutinemetrics "github.com/platform-mesh/subroutines/metrics"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	mccontext "sigs.k8s.io/multicluster-runtime/pkg/context"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
+
+	"github.com/platform-mesh/subroutines"
+	subroutinemetrics "github.com/platform-mesh/subroutines/metrics"
 
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -102,6 +104,7 @@ func (l *Lifecycle) WithTerminator(name string) *Lifecycle {
 
 // Reconcile implements mcreconcile.Reconciler.
 func (l *Lifecycle) Reconcile(ctx context.Context, req mcreconcile.Request) (reconcile.Result, error) {
+	ctx = mccontext.WithCluster(ctx, req.ClusterName)
 	ctx, span := tracer.Start(ctx, fmt.Sprintf("%s/reconcile", l.controllerName))
 	defer span.End()
 
