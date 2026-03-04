@@ -1,0 +1,137 @@
+package conditions
+
+import (
+	"fmt"
+
+	"github.com/platform-mesh/subroutines"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+const (
+	ReadyCondition = "Ready"
+
+	ReasonComplete = "Complete"
+	ReasonPending  = "Pending"
+	ReasonStopped  = "Stopped"
+	ReasonError    = "Error"
+	ReasonUnknown  = "Unknown"
+)
+
+// Manager manages per-subroutine and aggregate Ready conditions on objects
+// that implement ConditionAccessor.
+type Manager struct{}
+
+// NewManager creates a new condition Manager.
+func NewManager() *Manager {
+	return &Manager{}
+}
+
+// InitUnknownConditions sets per-subroutine and Ready conditions to Unknown
+// if they are not already present.
+func (m *Manager) InitUnknownConditions(obj client.Object, subroutineNames []string, generation int64) {
+	accessor, ok := obj.(ConditionAccessor)
+	if !ok {
+		return
+	}
+
+	for _, name := range subroutineNames {
+		m.ensureCondition(accessor, name, generation)
+	}
+	m.ensureCondition(accessor, ReadyCondition, generation)
+}
+
+// SetSubroutineCondition maps a subroutine result/error to a condition on the object.
+func (m *Manager) SetSubroutineCondition(obj client.Object, name string, result subroutines.Result, err error, isFinalize bool, generation int64) {
+	accessor, ok := obj.(ConditionAccessor)
+	if !ok {
+		return
+	}
+
+	condName := name
+	if isFinalize {
+		condName = name + "_Finalize"
+	}
+
+	cond := metav1.Condition{
+		Type:               condName,
+		ObservedGeneration: generation,
+	}
+
+	switch {
+	case err != nil:
+		cond.Status = metav1.ConditionFalse
+		cond.Reason = ReasonError
+		cond.Message = err.Error()
+	case result.IsPending():
+		cond.Status = metav1.ConditionUnknown
+		cond.Reason = ReasonPending
+		cond.Message = result.Message()
+	case result.IsStopWithRequeue() || result.IsStop():
+		cond.Status = metav1.ConditionFalse
+		cond.Reason = ReasonStopped
+		cond.Message = result.Message()
+	default:
+		cond.Status = metav1.ConditionTrue
+		cond.Reason = ReasonComplete
+		cond.Message = result.Message()
+	}
+
+	conditions := accessor.GetConditions()
+	meta.SetStatusCondition(&conditions, cond)
+	accessor.SetConditions(conditions)
+}
+
+// SetReadyCondition sets the aggregate Ready condition based on subroutine outcomes.
+func (m *Manager) SetReadyCondition(obj client.Object, hasErrors bool, hasPending bool, hasStopped bool, generation int64) {
+	accessor, ok := obj.(ConditionAccessor)
+	if !ok {
+		return
+	}
+
+	cond := metav1.Condition{
+		Type:               ReadyCondition,
+		ObservedGeneration: generation,
+	}
+
+	switch {
+	case hasErrors:
+		cond.Status = metav1.ConditionFalse
+		cond.Reason = ReasonError
+		cond.Message = "one or more subroutines encountered an error"
+	case hasStopped:
+		cond.Status = metav1.ConditionFalse
+		cond.Reason = ReasonStopped
+		cond.Message = "one or more subroutines stopped the chain"
+	case hasPending:
+		cond.Status = metav1.ConditionUnknown
+		cond.Reason = ReasonPending
+		cond.Message = "one or more subroutines are pending"
+	default:
+		cond.Status = metav1.ConditionTrue
+		cond.Reason = ReasonComplete
+		cond.Message = "all subroutines completed successfully"
+	}
+
+	conditions := accessor.GetConditions()
+	meta.SetStatusCondition(&conditions, cond)
+	accessor.SetConditions(conditions)
+}
+
+func (m *Manager) ensureCondition(accessor ConditionAccessor, name string, generation int64) {
+	conditions := accessor.GetConditions()
+	if meta.FindStatusCondition(conditions, name) != nil {
+		return
+	}
+
+	meta.SetStatusCondition(&conditions, metav1.Condition{
+		Type:               name,
+		Status:             metav1.ConditionUnknown,
+		Reason:             ReasonUnknown,
+		Message:            fmt.Sprintf("awaiting first reconciliation for %s", name),
+		ObservedGeneration: generation,
+	})
+	accessor.SetConditions(conditions)
+}

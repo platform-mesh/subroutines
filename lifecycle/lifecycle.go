@@ -1,0 +1,506 @@
+package lifecycle
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"slices"
+	"time"
+
+	"github.com/platform-mesh/subroutines"
+	subroutinemetrics "github.com/platform-mesh/subroutines/metrics"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+
+	"k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime"
+)
+
+var tracer = otel.Tracer("github.com/platform-mesh/subroutines/lifecycle")
+
+// Lifecycle orchestrates subroutine execution for a Kubernetes controller.
+type Lifecycle struct {
+	mgr            ClusterManager
+	newObj         func() client.Object
+	controllerName string
+	subroutines    []subroutines.Subroutine
+
+	conditions     ConditionManager
+	spread         SpreadManager
+	errorReporters []ErrorReporter
+	prepareCtx     func(ctx context.Context, obj client.Object) (context.Context, error)
+	readOnly       bool
+	specPatch      bool
+	initializer    string
+	terminator     string
+}
+
+// New creates a Lifecycle for the given controller.
+func New(mgr ClusterManager, controllerName string, newObj func() client.Object, subs ...subroutines.Subroutine) *Lifecycle {
+	return &Lifecycle{
+		mgr:            mgr,
+		controllerName: controllerName,
+		newObj:         newObj,
+		subroutines:    subs,
+	}
+}
+
+// WithConditions enables condition management.
+func (l *Lifecycle) WithConditions(cm ConditionManager) *Lifecycle {
+	l.conditions = cm
+	return l
+}
+
+// WithSpread enables reconciliation spreading.
+func (l *Lifecycle) WithSpread(sm SpreadManager) *Lifecycle {
+	l.spread = sm
+	return l
+}
+
+// WithErrorReporter adds an error reporter.
+func (l *Lifecycle) WithErrorReporter(r ErrorReporter) *Lifecycle {
+	l.errorReporters = append(l.errorReporters, r)
+	return l
+}
+
+// WithPrepareContext sets a function to enrich the context before subroutines run.
+func (l *Lifecycle) WithPrepareContext(fn func(ctx context.Context, obj client.Object) (context.Context, error)) *Lifecycle {
+	l.prepareCtx = fn
+	return l
+}
+
+// WithReadOnly disables all patches.
+func (l *Lifecycle) WithReadOnly() *Lifecycle {
+	l.readOnly = true
+	return l
+}
+
+// WithSpecPatch enables spec patching when spec changes are detected.
+func (l *Lifecycle) WithSpecPatch() *Lifecycle {
+	l.specPatch = true
+	return l
+}
+
+// WithInitializer sets the initializer name to look for in status.
+func (l *Lifecycle) WithInitializer(name string) *Lifecycle {
+	l.initializer = name
+	return l
+}
+
+// WithTerminator sets the terminator name to look for in status.
+func (l *Lifecycle) WithTerminator(name string) *Lifecycle {
+	l.terminator = name
+	return l
+}
+
+// Reconcile implements reconcile.Reconciler.
+func (l *Lifecycle) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	ctx, span := tracer.Start(ctx, fmt.Sprintf("%s/reconcile", l.controllerName))
+	defer span.End()
+
+	c, err := l.mgr.ClusterFromContext(ctx)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("resolving cluster client: %w", err)
+	}
+	cl := c.GetClient()
+	ctx = subroutines.WithClient(ctx, cl)
+
+	obj := l.newObj()
+	if err := cl.Get(ctx, req.NamespacedName, obj); err != nil {
+		if apierrors.IsNotFound(err) {
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, fmt.Errorf("fetching object: %w", err)
+	}
+
+	original := obj.DeepCopyObject().(client.Object)
+	isDeleting := obj.GetDeletionTimestamp() != nil
+	generation := obj.GetGeneration()
+
+	logger := log.FromContext(ctx).WithValues(
+		"controller", l.controllerName,
+		"name", obj.GetName(),
+		"namespace", obj.GetNamespace(),
+		"generation", generation,
+	)
+	ctx = log.IntoContext(ctx, logger)
+
+	span.SetAttributes(
+		attribute.String("controller", l.controllerName),
+		attribute.String("name", obj.GetName()),
+		attribute.String("namespace", obj.GetNamespace()),
+		attribute.Int64("generation", generation),
+		attribute.Bool("deleting", isDeleting),
+	)
+
+	// Spread check.
+	if l.spread != nil && !isDeleting {
+		if !l.spread.ReconcileRequired(obj) {
+			logger.V(1).Info("skipping reconciliation, not yet due")
+			return ctrl.Result{RequeueAfter: l.spread.RequeueDelay(obj)}, nil
+		}
+	}
+
+	// Add finalizers.
+	if !isDeleting && !l.readOnly {
+		if err := l.addFinalizers(ctx, cl, obj); err != nil {
+			return ctrl.Result{}, fmt.Errorf("adding finalizers: %w", err)
+		}
+		// Re-read the original after finalizer patch to avoid stale data.
+		original = obj.DeepCopyObject().(client.Object)
+	}
+
+	// Prepare context.
+	if l.prepareCtx != nil {
+		ctx, err = l.prepareCtx(ctx, obj)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("preparing context: %w", err)
+		}
+	}
+
+	// Init conditions.
+	subNames := make([]string, 0, len(l.subroutines))
+	for _, sub := range l.subroutines {
+		subNames = append(subNames, sub.GetName())
+	}
+	if l.conditions != nil {
+		l.conditions.InitUnknownConditions(obj, subNames, generation)
+	}
+
+	// Build execution order.
+	subs := slices.Clone(l.subroutines)
+	if isDeleting {
+		slices.Reverse(subs)
+	}
+
+	// Execute subroutines.
+	var (
+		subroutineErr error
+		hasPending    bool
+		hasStopped    bool
+		minRequeue    time.Duration
+	)
+
+	for _, sub := range subs {
+		action, actionName := l.resolveAction(sub, obj, isDeleting)
+		if action == nil {
+			continue
+		}
+
+		subCtx, subSpan := tracer.Start(ctx, fmt.Sprintf("%s/%s/%s", l.controllerName, sub.GetName(), actionName),
+			trace.WithAttributes(attribute.String("subroutine", sub.GetName()), attribute.String("action", actionName)),
+		)
+
+		start := time.Now()
+		result, err := action(subCtx, obj)
+		duration := time.Since(start)
+		subSpan.End()
+
+		subroutinemetrics.Record(l.controllerName, sub.GetName(), actionName, result, err, duration)
+		isFinalize := actionName == "finalize" || actionName == "terminate"
+
+		if err != nil {
+			logger.Error(err, "subroutine failed", "subroutine", sub.GetName(), "action", actionName)
+			if l.conditions != nil {
+				l.conditions.SetSubroutineCondition(obj, sub.GetName(), result, err, isFinalize, generation)
+			}
+			for _, reporter := range l.errorReporters {
+				reporter.Report(ctx, err, ErrorInfo{
+					Subroutine: sub.GetName(),
+					Object:     obj,
+					Action:     actionName,
+				})
+			}
+			subroutineErr = err
+			break
+		}
+
+		if l.conditions != nil {
+			l.conditions.SetSubroutineCondition(obj, sub.GetName(), result, nil, isFinalize, generation)
+		}
+
+		// Track min requeue across all subroutines.
+		if d := result.Requeue(); d > 0 {
+			if minRequeue == 0 || d < minRequeue {
+				minRequeue = d
+			}
+		}
+
+		// Remove finalizers after successful finalize with no requeue.
+		if actionName == "finalize" && result.IsContinue() && result.Requeue() == 0 {
+			if finalizer, ok := sub.(subroutines.Finalizer); ok {
+				for _, f := range finalizer.Finalizers(obj) {
+					removeFinalizer(obj, f)
+				}
+			}
+		}
+
+		if result.IsPending() {
+			hasPending = true
+		}
+
+		if result.IsStopWithRequeue() || result.IsStop() {
+			hasStopped = true
+			logger.Info("subroutine stopped the chain", "subroutine", sub.GetName(), "action", actionName, "message", result.Message())
+			break
+		}
+	}
+
+	// Remove initializer/terminator from status if all succeeded with no requeue.
+	if subroutineErr == nil && !hasStopped && !hasPending && minRequeue == 0 {
+		if l.initializer != "" && !isDeleting {
+			if removeMarkerFromStatus(obj, "initializers", l.initializer) {
+				logger.V(1).Info("removed initializer from status", "initializer", l.initializer)
+			}
+		}
+		if l.terminator != "" && isDeleting {
+			if removeMarkerFromStatus(obj, "terminators", l.terminator) {
+				logger.V(1).Info("removed terminator from status", "terminator", l.terminator)
+			}
+		}
+	}
+
+	// Set Ready condition.
+	if l.conditions != nil {
+		l.conditions.SetReadyCondition(obj, subroutineErr != nil, hasPending, hasStopped, generation)
+	}
+
+	// Update spread state.
+	if l.spread != nil && !isDeleting && subroutineErr == nil {
+		l.spread.UpdateObservedGeneration(obj)
+		l.spread.SetNextReconcileTime(obj)
+		if l.spread.RemoveRefreshLabel(obj) {
+			logger.V(1).Info("removed refresh label")
+		}
+	}
+
+	// Patch changes.
+	if !l.readOnly {
+		patchErr := l.patchChanges(ctx, cl, original, obj)
+		if patchErr != nil {
+			return ctrl.Result{}, errors.Join(subroutineErr, patchErr)
+		}
+	}
+
+	return ctrl.Result{RequeueAfter: minRequeue}, subroutineErr
+}
+
+type actionFunc func(ctx context.Context, obj client.Object) (subroutines.Result, error)
+
+func (l *Lifecycle) resolveAction(sub subroutines.Subroutine, obj client.Object, isDeleting bool) (actionFunc, string) {
+	if isDeleting {
+		// Terminator takes precedence when configured and marker is in status.
+		if l.terminator != "" && hasMarkerInStatus(obj, "terminators", l.terminator) {
+			if t, ok := sub.(subroutines.Terminator); ok {
+				return t.Terminate, "terminate"
+			}
+		}
+		// Finalizer.
+		if f, ok := sub.(subroutines.Finalizer); ok {
+			if hasAnyFinalizer(obj, f.Finalizers(obj)) {
+				return f.Finalize, "finalize"
+			}
+		}
+		return nil, ""
+	}
+
+	// Initializer takes precedence when configured and marker is in status.
+	if l.initializer != "" && hasMarkerInStatus(obj, "initializers", l.initializer) {
+		if i, ok := sub.(subroutines.Initializer); ok {
+			return i.Initialize, "initialize"
+		}
+	}
+	// Processor.
+	if p, ok := sub.(subroutines.Processor); ok {
+		return p.Process, "process"
+	}
+	return nil, ""
+}
+
+func (l *Lifecycle) addFinalizers(ctx context.Context, cl client.Client, obj client.Object) error {
+	var missing []string
+	current := obj.GetFinalizers()
+	for _, sub := range l.subroutines {
+		f, ok := sub.(subroutines.Finalizer)
+		if !ok {
+			continue
+		}
+		for _, fin := range f.Finalizers(obj) {
+			if !slices.Contains(current, fin) {
+				missing = append(missing, fin)
+			}
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	patch := client.MergeFrom(obj.DeepCopyObject().(client.Object))
+	obj.SetFinalizers(append(current, missing...))
+	return cl.Patch(ctx, obj, patch)
+}
+
+func (l *Lifecycle) patchChanges(ctx context.Context, cl client.Client, original, current client.Object) error {
+	logger := log.FromContext(ctx)
+
+	origData, err := toUnstructuredMap(original)
+	if err != nil {
+		return fmt.Errorf("converting original to unstructured: %w", err)
+	}
+	currData, err := toUnstructuredMap(current)
+	if err != nil {
+		return fmt.Errorf("converting current to unstructured: %w", err)
+	}
+
+	var patchErr error
+
+	// Metadata patch (labels, annotations, finalizers).
+	if !equality.Semantic.DeepEqual(getMap(origData, "metadata"), getMap(currData, "metadata")) {
+		logger.V(1).Info("patching metadata")
+		patch := client.MergeFrom(original)
+		if err := cl.Patch(ctx, current, patch); err != nil {
+			patchErr = errors.Join(patchErr, fmt.Errorf("patching metadata: %w", err))
+		}
+	}
+
+	// Spec patch.
+	if l.specPatch && !equality.Semantic.DeepEqual(getMap(origData, "spec"), getMap(currData, "spec")) {
+		logger.V(1).Info("patching spec")
+		patch := client.MergeFrom(original)
+		if err := cl.Patch(ctx, current, patch); err != nil {
+			patchErr = errors.Join(patchErr, fmt.Errorf("patching spec: %w", err))
+		}
+	}
+
+	// Status patch — skip if object is about to be deleted (no finalizers + deletion timestamp).
+	if current.GetDeletionTimestamp() != nil && len(current.GetFinalizers()) == 0 {
+		return patchErr
+	}
+	if !equality.Semantic.DeepEqual(getMap(origData, "status"), getMap(currData, "status")) {
+		logger.V(1).Info("patching status")
+		patch := client.MergeFrom(original)
+		if err := cl.Status().Patch(ctx, current, patch); err != nil {
+			patchErr = errors.Join(patchErr, fmt.Errorf("patching status: %w", err))
+		}
+	}
+
+	return patchErr
+}
+
+func toUnstructuredMap(obj client.Object) (map[string]any, error) {
+	data, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+func getMap(data map[string]any, key string) map[string]any {
+	if v, ok := data[key]; ok {
+		if m, ok := v.(map[string]any); ok {
+			return m
+		}
+	}
+	return nil
+}
+
+func removeFinalizer(obj client.Object, fin string) {
+	finalizers := obj.GetFinalizers()
+	finalizers = slices.DeleteFunc(finalizers, func(f string) bool { return f == fin })
+	obj.SetFinalizers(finalizers)
+}
+
+func hasAnyFinalizer(obj client.Object, fins []string) bool {
+	current := obj.GetFinalizers()
+	for _, f := range fins {
+		if slices.Contains(current, f) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasMarkerInStatus checks if a named marker exists in obj.status[field].
+// Uses unstructured conversion to avoid type assertions.
+func hasMarkerInStatus(obj client.Object, field, name string) bool {
+	data, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
+	if err != nil {
+		return false
+	}
+	status, ok := data["status"].(map[string]any)
+	if !ok {
+		return false
+	}
+	markers, ok := status[field]
+	if !ok {
+		return false
+	}
+	// Markers can be a string or a slice of strings.
+	switch v := markers.(type) {
+	case string:
+		return v == name
+	case []any:
+		for _, m := range v {
+			if s, ok := m.(string); ok && s == name {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// removeMarkerFromStatus removes a named marker from obj.status[field] using
+// unstructured conversion. Returns true if the marker was found and removed.
+func removeMarkerFromStatus(obj client.Object, field, name string) bool {
+	data, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
+	if err != nil {
+		return false
+	}
+	status, ok := data["status"].(map[string]any)
+	if !ok {
+		return false
+	}
+	markers, ok := status[field]
+	if !ok {
+		return false
+	}
+
+	modified := false
+	switch v := markers.(type) {
+	case string:
+		if v == name {
+			delete(status, field)
+			modified = true
+		}
+	case []any:
+		var filtered []any
+		for _, m := range v {
+			if s, ok := m.(string); ok && s == name {
+				modified = true
+				continue
+			}
+			filtered = append(filtered, m)
+		}
+		if modified {
+			if len(filtered) == 0 {
+				delete(status, field)
+			} else {
+				status[field] = filtered
+			}
+		}
+	}
+
+	if !modified {
+		return false
+	}
+
+	data["status"] = status
+	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(data, obj); err != nil {
+		return false
+	}
+	return true
+}
