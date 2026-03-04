@@ -7,16 +7,16 @@ import (
 	"slices"
 	"time"
 
+	"github.com/platform-mesh/subroutines"
+	subroutinemetrics "github.com/platform-mesh/subroutines/metrics"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
-
-	"github.com/platform-mesh/subroutines"
-	subroutinemetrics "github.com/platform-mesh/subroutines/metrics"
+	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -100,14 +100,14 @@ func (l *Lifecycle) WithTerminator(name string) *Lifecycle {
 	return l
 }
 
-// Reconcile implements reconcile.Reconciler.
-func (l *Lifecycle) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+// Reconcile implements mcreconcile.Reconciler.
+func (l *Lifecycle) Reconcile(ctx context.Context, req mcreconcile.Request) (reconcile.Result, error) {
 	ctx, span := tracer.Start(ctx, fmt.Sprintf("%s/reconcile", l.controllerName))
 	defer span.End()
 
 	c, err := l.mgr.ClusterFromContext(ctx)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("resolving cluster client: %w", err)
+		return reconcile.Result{}, fmt.Errorf("resolving cluster client: %w", err)
 	}
 	cl := c.GetClient()
 	ctx = subroutines.WithClient(ctx, cl)
@@ -115,9 +115,9 @@ func (l *Lifecycle) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resul
 	obj := l.newObj()
 	if err := cl.Get(ctx, req.NamespacedName, obj); err != nil {
 		if apierrors.IsNotFound(err) {
-			return ctrl.Result{}, nil
+			return reconcile.Result{}, nil
 		}
-		return ctrl.Result{}, fmt.Errorf("fetching object: %w", err)
+		return reconcile.Result{}, fmt.Errorf("fetching object: %w", err)
 	}
 
 	original := obj.DeepCopyObject().(client.Object)
@@ -126,6 +126,7 @@ func (l *Lifecycle) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resul
 
 	logger := log.FromContext(ctx).WithValues(
 		"controller", l.controllerName,
+		"cluster", req.ClusterName,
 		"name", obj.GetName(),
 		"namespace", obj.GetNamespace(),
 		"generation", generation,
@@ -134,6 +135,7 @@ func (l *Lifecycle) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resul
 
 	span.SetAttributes(
 		attribute.String("controller", l.controllerName),
+		attribute.String("cluster", req.ClusterName),
 		attribute.String("name", obj.GetName()),
 		attribute.String("namespace", obj.GetNamespace()),
 		attribute.Int64("generation", generation),
@@ -144,14 +146,14 @@ func (l *Lifecycle) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resul
 	if l.spread != nil && !isDeleting {
 		if !l.spread.ReconcileRequired(obj) {
 			logger.V(1).Info("skipping reconciliation, not yet due")
-			return ctrl.Result{RequeueAfter: l.spread.RequeueDelay(obj)}, nil
+			return reconcile.Result{RequeueAfter: l.spread.RequeueDelay(obj)}, nil
 		}
 	}
 
 	// Add finalizers.
 	if !isDeleting && !l.readOnly {
 		if err := l.addFinalizers(ctx, cl, obj); err != nil {
-			return ctrl.Result{}, fmt.Errorf("adding finalizers: %w", err)
+			return reconcile.Result{}, fmt.Errorf("adding finalizers: %w", err)
 		}
 		// Re-read the original after finalizer patch to avoid stale data.
 		original = obj.DeepCopyObject().(client.Object)
@@ -161,7 +163,7 @@ func (l *Lifecycle) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resul
 	if l.prepareCtx != nil {
 		ctx, err = l.prepareCtx(ctx, obj)
 		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("preparing context: %w", err)
+			return reconcile.Result{}, fmt.Errorf("preparing context: %w", err)
 		}
 	}
 
@@ -286,11 +288,11 @@ func (l *Lifecycle) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resul
 	if !l.readOnly {
 		patchErr := l.patchChanges(ctx, cl, original, obj)
 		if patchErr != nil {
-			return ctrl.Result{}, errors.Join(subroutineErr, patchErr)
+			return reconcile.Result{}, errors.Join(subroutineErr, patchErr)
 		}
 	}
 
-	return ctrl.Result{RequeueAfter: minRequeue}, subroutineErr
+	return reconcile.Result{RequeueAfter: minRequeue}, subroutineErr
 }
 
 type actionFunc func(ctx context.Context, obj client.Object) (subroutines.Result, error)

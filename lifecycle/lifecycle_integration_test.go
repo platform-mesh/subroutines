@@ -20,9 +20,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 )
 
 // Integration test CRD (reuses testObject from unit tests).
@@ -75,8 +76,8 @@ func TestIntegration_FullLifecycle(t *testing.T) {
 	require.NoError(t, cl.Create(context.Background(), obj))
 
 	// First reconcile — should process, add finalizer, set conditions.
-	result, err := lc.Reconcile(context.Background(), ctrl.Request{
-		NamespacedName: types.NamespacedName{Name: "integration-test", Namespace: "default"},
+	result, err := lc.Reconcile(context.Background(), mcreconcile.Request{
+		Request: reconcile.Request{NamespacedName: types.NamespacedName{Name: "integration-test", Namespace: "default"}},
 	})
 	require.NoError(t, err)
 	assert.True(t, processCalled)
@@ -96,8 +97,8 @@ func TestIntegration_FullLifecycle(t *testing.T) {
 	require.NoError(t, cl.Delete(context.Background(), fetched))
 
 	// Reconcile deletion.
-	result, err = lc.Reconcile(context.Background(), ctrl.Request{
-		NamespacedName: types.NamespacedName{Name: "integration-test", Namespace: "default"},
+	result, err = lc.Reconcile(context.Background(), mcreconcile.Request{
+		Request: reconcile.Request{NamespacedName: types.NamespacedName{Name: "integration-test", Namespace: "default"}},
 	})
 	require.NoError(t, err)
 	assert.True(t, finalizeCalled)

@@ -10,9 +10,10 @@ import (
 	"github.com/platform-mesh/subroutines/conditions"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -127,8 +128,10 @@ func newTestObj(name, ns string) *testObject {
 	}
 }
 
-func newReq(name, ns string) ctrl.Request {
-	return ctrl.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}}
+func newReq(name, ns string) mcreconcile.Request {
+	return mcreconcile.Request{
+		Request: reconcile.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}},
+	}
 }
 
 func setupLifecycle(cl client.Client, subs ...subroutines.Subroutine) *Lifecycle {
@@ -144,7 +147,7 @@ func TestObjectNotFound(t *testing.T) {
 
 	result, err := lc.Reconcile(context.Background(), newReq("missing", "default"))
 	require.NoError(t, err)
-	assert.Equal(t, ctrl.Result{}, result)
+	assert.Equal(t, reconcile.Result{}, result)
 }
 
 func TestSingleProcessor(t *testing.T) {
@@ -160,7 +163,7 @@ func TestSingleProcessor(t *testing.T) {
 
 	result, err := lc.Reconcile(context.Background(), newReq("test", "default"))
 	require.NoError(t, err)
-	assert.Equal(t, ctrl.Result{}, result)
+	assert.Equal(t, reconcile.Result{}, result)
 
 	// Verify conditions were set.
 	fetched := &testObject{}
@@ -258,7 +261,7 @@ func TestStop_BreaksChainNoRequeue(t *testing.T) {
 
 	result, err := lc.Reconcile(context.Background(), newReq("test", "default"))
 	require.NoError(t, err)
-	assert.Equal(t, ctrl.Result{}, result)
+	assert.Equal(t, reconcile.Result{}, result)
 }
 
 func TestPending_ContinuesChain(t *testing.T) {
@@ -346,7 +349,7 @@ func TestFinalizeFlow(t *testing.T) {
 
 	result, err := lc.Reconcile(context.Background(), newReq("test", "default"))
 	require.NoError(t, err)
-	assert.Equal(t, ctrl.Result{}, result)
+	assert.Equal(t, reconcile.Result{}, result)
 	assert.True(t, finalizeCalled)
 }
 
