@@ -7,14 +7,16 @@ import (
 	"slices"
 	"time"
 
-	"github.com/platform-mesh/subroutines"
-	subroutinemetrics "github.com/platform-mesh/subroutines/metrics"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
+
+	"github.com/platform-mesh/subroutines"
+	subroutinemetrics "github.com/platform-mesh/subroutines/metrics"
 
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -25,7 +27,7 @@ var tracer = otel.Tracer("github.com/platform-mesh/subroutines/lifecycle")
 
 // Lifecycle orchestrates subroutine execution for a Kubernetes controller.
 type Lifecycle struct {
-	mgr            ClusterManager
+	mgr            mcmanager.Manager
 	newObj         func() client.Object
 	controllerName string
 	subroutines    []subroutines.Subroutine
@@ -41,7 +43,7 @@ type Lifecycle struct {
 }
 
 // New creates a Lifecycle for the given controller.
-func New(mgr ClusterManager, controllerName string, newObj func() client.Object, subs ...subroutines.Subroutine) *Lifecycle {
+func New(mgr mcmanager.Manager, controllerName string, newObj func() client.Object, subs ...subroutines.Subroutine) *Lifecycle {
 	return &Lifecycle{
 		mgr:            mgr,
 		controllerName: controllerName,

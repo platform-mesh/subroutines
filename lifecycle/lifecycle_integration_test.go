@@ -22,19 +22,10 @@ import (
 
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/cluster"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 )
 
 // Integration test CRD (reuses testObject from unit tests).
-
-type envtestClusterManager struct {
-	cl client.Client
-}
-
-func (e *envtestClusterManager) ClusterFromContext(context.Context) (cluster.Cluster, error) {
-	return &fakeCluster{cl: e.cl}, nil
-}
 
 func TestIntegration_FullLifecycle(t *testing.T) {
 	// Start envtest.
@@ -53,7 +44,7 @@ func TestIntegration_FullLifecycle(t *testing.T) {
 	cl, err := client.New(cfg, client.Options{Scheme: s})
 	require.NoError(t, err)
 
-	mgr := &envtestClusterManager{cl: cl}
+	mgr := &fakeManager{cl: cl}
 	condMgr := conditions.NewManager()
 	spreadMgr := spread.NewManager(
 		spread.WithMinDuration(1*time.Hour),

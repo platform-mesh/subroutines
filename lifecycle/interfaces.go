@@ -1,19 +1,11 @@
 package lifecycle
 
 import (
-	"context"
 	"time"
 
 	"github.com/platform-mesh/subroutines"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/cluster"
 )
-
-// ClusterManager provides access to per-cluster clients.
-// Satisfied by multicluster-runtime's mcmanager.Manager.
-type ClusterManager interface {
-	ClusterFromContext(ctx context.Context) (cluster.Cluster, error)
-}
 
 // ConditionManager manages per-subroutine and aggregate conditions.
 type ConditionManager interface {

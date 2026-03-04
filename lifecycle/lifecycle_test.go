@@ -13,7 +13,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/controller-runtime/pkg/cluster"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -67,23 +66,6 @@ func (t *testObject) DeepCopyObject() runtime.Object {
 
 func (t *testObject) GetConditions() []metav1.Condition  { return t.Status.Conditions }
 func (t *testObject) SetConditions(c []metav1.Condition) { t.Status.Conditions = c }
-
-// --- Fake Cluster Manager ---
-
-type fakeClusterManager struct {
-	cl client.Client
-}
-
-func (f *fakeClusterManager) ClusterFromContext(context.Context) (cluster.Cluster, error) {
-	return &fakeCluster{cl: f.cl}, nil
-}
-
-type fakeCluster struct {
-	cluster.Cluster
-	cl client.Client
-}
-
-func (f *fakeCluster) GetClient() client.Client { return f.cl }
 
 // --- Stub Subroutines ---
 
@@ -150,7 +132,7 @@ func newReq(name, ns string) ctrl.Request {
 }
 
 func setupLifecycle(cl client.Client, subs ...subroutines.Subroutine) *Lifecycle {
-	mgr := &fakeClusterManager{cl: cl}
+	mgr := &fakeManager{cl: cl}
 	return New(mgr, "test-controller", func() client.Object { return &testObject{} }, subs...)
 }
 
