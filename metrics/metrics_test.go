@@ -24,7 +24,6 @@ func TestMetricsRegistered(t *testing.T) {
 	}
 
 	assert.True(t, names["lifecycle_subroutine_duration_seconds"], "duration metric should be registered")
-	assert.True(t, names["lifecycle_subroutine_errors_total"] || true, "errors metric registered after error recording")
 }
 
 func TestRecord(t *testing.T) {

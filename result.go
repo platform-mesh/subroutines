@@ -31,6 +31,8 @@ func OKWithRequeue(d time.Duration) Result {
 
 // Pending returns a Result that continues the chain, sets the condition to Unknown,
 // and requeues after d. Use Pending when a subroutine is waiting on an external condition.
+// Note: the lifecycle engine picks the shortest requeue across all subroutines, so a
+// later subroutine returning OKWithRequeue with a shorter duration will take precedence.
 func Pending(d time.Duration, msg string) Result {
 	return Result{action: actionPending, requeue: d, message: msg}
 }

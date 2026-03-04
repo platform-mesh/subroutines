@@ -1,6 +1,7 @@
 package spread
 
 import (
+	"fmt"
 	"math/rand/v2"
 	"time"
 
@@ -37,6 +38,7 @@ type Manager struct {
 }
 
 // NewManager creates a new spread Manager with the given options.
+// Panics if minDuration > maxDuration after applying options.
 func NewManager(opts ...Option) *Manager {
 	m := &Manager{
 		minDuration: defaultMinDuration,
@@ -44,6 +46,9 @@ func NewManager(opts ...Option) *Manager {
 	}
 	for _, opt := range opts {
 		opt(m)
+	}
+	if m.minDuration > m.maxDuration {
+		panic(fmt.Sprintf("spread: minDuration (%s) must not exceed maxDuration (%s)", m.minDuration, m.maxDuration))
 	}
 	return m
 }

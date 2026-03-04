@@ -224,7 +224,8 @@ func (l *Lifecycle) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resul
 			l.conditions.SetSubroutineCondition(obj, sub.GetName(), result, nil, isFinalize, generation)
 		}
 
-		// Track min requeue across all subroutines.
+		// Track min requeue across all subroutines — the shortest duration wins
+		// regardless of result type (OK, Pending, or StopWithRequeue).
 		if d := result.Requeue(); d > 0 {
 			if minRequeue == 0 || d < minRequeue {
 				minRequeue = d
@@ -356,39 +357,34 @@ func (l *Lifecycle) patchChanges(ctx context.Context, cl client.Client, original
 		return fmt.Errorf("converting current to unstructured: %w", err)
 	}
 
-	var patchErr error
-
-	// Metadata patch (labels, annotations, finalizers).
-	if !equality.Semantic.DeepEqual(getMap(origData, "metadata"), getMap(currData, "metadata")) {
-		logger.V(1).Info("patching metadata")
-		patch := client.MergeFrom(original)
-		if err := cl.Patch(ctx, current, patch); err != nil {
-			patchErr = errors.Join(patchErr, fmt.Errorf("patching metadata: %w", err))
-		}
+	// Single object patch for metadata + spec changes.
+	needsObjectPatch := !equality.Semantic.DeepEqual(getMap(origData, "metadata"), getMap(currData, "metadata"))
+	if l.specPatch {
+		needsObjectPatch = needsObjectPatch || !equality.Semantic.DeepEqual(getMap(origData, "spec"), getMap(currData, "spec"))
 	}
-
-	// Spec patch.
-	if l.specPatch && !equality.Semantic.DeepEqual(getMap(origData, "spec"), getMap(currData, "spec")) {
-		logger.V(1).Info("patching spec")
+	if needsObjectPatch {
+		logger.V(1).Info("patching object")
 		patch := client.MergeFrom(original)
 		if err := cl.Patch(ctx, current, patch); err != nil {
-			patchErr = errors.Join(patchErr, fmt.Errorf("patching spec: %w", err))
+			return fmt.Errorf("patching object: %w", err)
 		}
+		// Refresh base so the status patch uses the updated resourceVersion.
+		original = current.DeepCopyObject().(client.Object)
 	}
 
 	// Status patch — skip if object is about to be deleted (no finalizers + deletion timestamp).
 	if current.GetDeletionTimestamp() != nil && len(current.GetFinalizers()) == 0 {
-		return patchErr
+		return nil
 	}
 	if !equality.Semantic.DeepEqual(getMap(origData, "status"), getMap(currData, "status")) {
 		logger.V(1).Info("patching status")
 		patch := client.MergeFrom(original)
 		if err := cl.Status().Patch(ctx, current, patch); err != nil {
-			patchErr = errors.Join(patchErr, fmt.Errorf("patching status: %w", err))
+			return fmt.Errorf("patching status: %w", err)
 		}
 	}
 
-	return patchErr
+	return nil
 }
 
 func toUnstructuredMap(obj client.Object) (map[string]any, error) {

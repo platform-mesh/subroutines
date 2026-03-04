@@ -781,3 +781,59 @@ func TestInitializer_NotRemovedOnPending(t *testing.T) {
 	require.NoError(t, cl.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, fetched))
 	assert.Contains(t, fetched.Status.Initializers, "bootstrap", "initializer should be kept when pending")
 }
+
+// --- Fake Spread Manager ---
+
+type fakeSpreadManager struct {
+	reconcileRequired bool
+	requeueDelay      time.Duration
+}
+
+func (f *fakeSpreadManager) ReconcileRequired(client.Object) bool     { return f.reconcileRequired }
+func (f *fakeSpreadManager) RequeueDelay(client.Object) time.Duration { return f.requeueDelay }
+func (f *fakeSpreadManager) SetNextReconcileTime(client.Object)       {}
+func (f *fakeSpreadManager) UpdateObservedGeneration(client.Object)   {}
+func (f *fakeSpreadManager) RemoveRefreshLabel(client.Object) bool    { return false }
+
+func TestSpread_SkipsWhenNotDue(t *testing.T) {
+	obj := newTestObj("test", "default")
+	cl := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(obj).WithStatusSubresource(obj).Build()
+
+	processCalled := false
+	sub := &processorSub{
+		name: "step1",
+		fn: func(context.Context, client.Object) (subroutines.Result, error) {
+			processCalled = true
+			return subroutines.OK(), nil
+		},
+	}
+
+	sm := &fakeSpreadManager{reconcileRequired: false, requeueDelay: 30 * time.Minute}
+	lc := setupLifecycle(cl, sub).WithSpread(sm)
+
+	result, err := lc.Reconcile(context.Background(), newReq("test", "default"))
+	require.NoError(t, err)
+	assert.False(t, processCalled, "subroutine should not run when spread says not due")
+	assert.Equal(t, 30*time.Minute, result.RequeueAfter)
+}
+
+func TestSpread_ReconcileWhenDue(t *testing.T) {
+	obj := newTestObj("test", "default")
+	cl := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(obj).WithStatusSubresource(obj).Build()
+
+	processCalled := false
+	sub := &processorSub{
+		name: "step1",
+		fn: func(context.Context, client.Object) (subroutines.Result, error) {
+			processCalled = true
+			return subroutines.OK(), nil
+		},
+	}
+
+	sm := &fakeSpreadManager{reconcileRequired: true}
+	lc := setupLifecycle(cl, sub).WithSpread(sm)
+
+	_, err := lc.Reconcile(context.Background(), newReq("test", "default"))
+	require.NoError(t, err)
+	assert.True(t, processCalled, "subroutine should run when spread says due")
+}

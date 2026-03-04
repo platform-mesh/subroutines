@@ -105,7 +105,7 @@ func TestSetSubroutineCondition(t *testing.T) {
 			isFinalize: true,
 			wantStatus: metav1.ConditionTrue,
 			wantReason: ReasonComplete,
-			wantType:   "mysub_Finalize",
+			wantType:   "mysubFinalize",
 		},
 	}
 

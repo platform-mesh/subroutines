@@ -52,7 +52,7 @@ func (m *Manager) SetSubroutineCondition(obj client.Object, name string, result 
 
 	condName := name
 	if isFinalize {
-		condName = name + "_Finalize"
+		condName = name + "Finalize"
 	}
 
 	cond := metav1.Condition{
