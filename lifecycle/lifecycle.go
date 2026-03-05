@@ -7,18 +7,20 @@ import (
 	"slices"
 	"time"
 
+	"github.com/platform-mesh/subroutines"
+	"github.com/platform-mesh/subroutines/conditions"
+	subroutinemetrics "github.com/platform-mesh/subroutines/metrics"
+	"github.com/platform-mesh/subroutines/spread"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	mccontext "sigs.k8s.io/multicluster-runtime/pkg/context"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
-
-	"github.com/platform-mesh/subroutines"
-	subroutinemetrics "github.com/platform-mesh/subroutines/metrics"
 
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -26,6 +28,13 @@ import (
 )
 
 var tracer = otel.Tracer("github.com/platform-mesh/subroutines/lifecycle")
+
+const (
+	// statusFieldInitializers is the status field name for initializer markers.
+	statusFieldInitializers = "initializers"
+	// statusFieldTerminators is the status field name for terminator markers.
+	statusFieldTerminators = "terminators"
+)
 
 // Lifecycle orchestrates subroutine execution for a Kubernetes controller.
 type Lifecycle struct {
@@ -55,13 +64,23 @@ func New(mgr mcmanager.Manager, controllerName string, newObj func() client.Obje
 }
 
 // WithConditions enables condition management.
+// Panics if the object produced by newObj does not implement conditions.ConditionAccessor.
 func (l *Lifecycle) WithConditions(cm ConditionManager) *Lifecycle {
+	l.mustImplement("conditions.ConditionAccessor", func(obj client.Object) bool {
+		_, ok := obj.(conditions.ConditionAccessor)
+		return ok
+	})
 	l.conditions = cm
 	return l
 }
 
 // WithSpread enables reconciliation spreading.
+// Panics if the object produced by newObj does not implement spread.SpreadReconcileStatus.
 func (l *Lifecycle) WithSpread(sm SpreadManager) *Lifecycle {
+	l.mustImplement("spread.SpreadReconcileStatus", func(obj client.Object) bool {
+		_, ok := obj.(spread.SpreadReconcileStatus)
+		return ok
+	})
 	l.spread = sm
 	return l
 }
@@ -194,7 +213,7 @@ func (l *Lifecycle) Reconcile(ctx context.Context, req mcreconcile.Request) (rec
 	)
 
 	for _, sub := range subs {
-		action, actionName := l.resolveAction(sub, obj, isDeleting)
+		action, actionName := l.resolveAction(ctx, sub, obj, isDeleting)
 		if action == nil {
 			continue
 		}
@@ -243,7 +262,7 @@ func (l *Lifecycle) Reconcile(ctx context.Context, req mcreconcile.Request) (rec
 		if actionName == "finalize" && result.IsContinue() && result.Requeue() == 0 {
 			if finalizer, ok := sub.(subroutines.Finalizer); ok {
 				for _, f := range finalizer.Finalizers(obj) {
-					removeFinalizer(obj, f)
+					controllerutil.RemoveFinalizer(obj, f)
 				}
 			}
 		}
@@ -262,12 +281,12 @@ func (l *Lifecycle) Reconcile(ctx context.Context, req mcreconcile.Request) (rec
 	// Remove initializer/terminator from status if all succeeded with no requeue.
 	if subroutineErr == nil && !hasStopped && !hasPending && minRequeue == 0 {
 		if l.initializer != "" && !isDeleting {
-			if removeMarkerFromStatus(obj, "initializers", l.initializer) {
+			if removeMarkerFromStatus(ctx, obj, statusFieldInitializers, l.initializer) {
 				logger.V(1).Info("removed initializer from status", "initializer", l.initializer)
 			}
 		}
 		if l.terminator != "" && isDeleting {
-			if removeMarkerFromStatus(obj, "terminators", l.terminator) {
+			if removeMarkerFromStatus(ctx, obj, statusFieldTerminators, l.terminator) {
 				logger.V(1).Info("removed terminator from status", "terminator", l.terminator)
 			}
 		}
@@ -300,10 +319,10 @@ func (l *Lifecycle) Reconcile(ctx context.Context, req mcreconcile.Request) (rec
 
 type actionFunc func(ctx context.Context, obj client.Object) (subroutines.Result, error)
 
-func (l *Lifecycle) resolveAction(sub subroutines.Subroutine, obj client.Object, isDeleting bool) (actionFunc, string) {
+func (l *Lifecycle) resolveAction(ctx context.Context, sub subroutines.Subroutine, obj client.Object, isDeleting bool) (actionFunc, string) {
 	if isDeleting {
 		// Terminator takes precedence when configured and marker is in status.
-		if l.terminator != "" && hasMarkerInStatus(obj, "terminators", l.terminator) {
+		if l.terminator != "" && hasMarkerInStatus(ctx, obj, statusFieldTerminators, l.terminator) {
 			if t, ok := sub.(subroutines.Terminator); ok {
 				return t.Terminate, "terminate"
 			}
@@ -318,7 +337,7 @@ func (l *Lifecycle) resolveAction(sub subroutines.Subroutine, obj client.Object,
 	}
 
 	// Initializer takes precedence when configured and marker is in status.
-	if l.initializer != "" && hasMarkerInStatus(obj, "initializers", l.initializer) {
+	if l.initializer != "" && hasMarkerInStatus(ctx, obj, statusFieldInitializers, l.initializer) {
 		if i, ok := sub.(subroutines.Initializer); ok {
 			return i.Initialize, "initialize"
 		}
@@ -379,7 +398,9 @@ func (l *Lifecycle) patchChanges(ctx context.Context, cl client.Client, original
 		original = current.DeepCopyObject().(client.Object)
 	}
 
-	// Status patch — skip if object is about to be deleted (no finalizers + deletion timestamp).
+	// Status patch — skip when the object will be garbage-collected imminently
+	// (deletion timestamp set and no finalizers remaining). A status update would
+	// race against deletion and serve no purpose.
 	if current.GetDeletionTimestamp() != nil && len(current.GetFinalizers()) == 0 {
 		return nil
 	}
@@ -411,10 +432,11 @@ func getMap(data map[string]any, key string) map[string]any {
 	return nil
 }
 
-func removeFinalizer(obj client.Object, fin string) {
-	finalizers := obj.GetFinalizers()
-	finalizers = slices.DeleteFunc(finalizers, func(f string) bool { return f == fin })
-	obj.SetFinalizers(finalizers)
+func (l *Lifecycle) mustImplement(iface string, check func(client.Object) bool) {
+	obj := l.newObj()
+	if !check(obj) {
+		panic(fmt.Sprintf("lifecycle %q: object type %T does not implement %s", l.controllerName, obj, iface))
+	}
 }
 
 func hasAnyFinalizer(obj client.Object, fins []string) bool {
@@ -429,9 +451,10 @@ func hasAnyFinalizer(obj client.Object, fins []string) bool {
 
 // hasMarkerInStatus checks if a named marker exists in obj.status[field].
 // Uses unstructured conversion to avoid type assertions.
-func hasMarkerInStatus(obj client.Object, field, name string) bool {
+func hasMarkerInStatus(ctx context.Context, obj client.Object, field, name string) bool {
 	data, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
 	if err != nil {
+		log.FromContext(ctx).Error(err, "failed to convert object to unstructured for marker check", "field", field, "name", name)
 		return false
 	}
 	status, ok := data["status"].(map[string]any)
@@ -458,9 +481,11 @@ func hasMarkerInStatus(obj client.Object, field, name string) bool {
 
 // removeMarkerFromStatus removes a named marker from obj.status[field] using
 // unstructured conversion. Returns true if the marker was found and removed.
-func removeMarkerFromStatus(obj client.Object, field, name string) bool {
+func removeMarkerFromStatus(ctx context.Context, obj client.Object, field, name string) bool {
+	logger := log.FromContext(ctx)
 	data, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
 	if err != nil {
+		logger.Error(err, "failed to convert object to unstructured for marker removal", "field", field, "name", name)
 		return false
 	}
 	status, ok := data["status"].(map[string]any)
@@ -503,6 +528,7 @@ func removeMarkerFromStatus(obj client.Object, field, name string) bool {
 
 	data["status"] = status
 	if err := runtime.DefaultUnstructuredConverter.FromUnstructured(data, obj); err != nil {
+		logger.Error(err, "failed to convert unstructured back to object after marker removal", "field", field, "name", name)
 		return false
 	}
 	return true

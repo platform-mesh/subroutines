@@ -38,9 +38,11 @@ type testSpec struct {
 }
 
 type testStatus struct {
-	Conditions   []metav1.Condition `json:"conditions,omitempty"`
-	Initializers []string           `json:"initializers,omitempty"`
-	Terminators  []string           `json:"terminators,omitempty"`
+	Conditions        []metav1.Condition `json:"conditions,omitempty"`
+	Initializers      []string           `json:"initializers,omitempty"`
+	Terminators       []string           `json:"terminators,omitempty"`
+	ObservedGen       int64              `json:"observedGeneration,omitempty"`
+	NextReconcileTime metav1.Time        `json:"nextReconcileTime,omitempty"`
 }
 
 func (t *testObject) GetObjectKind() schema.ObjectKind { return &t.TypeMeta }
@@ -67,6 +69,11 @@ func (t *testObject) DeepCopyObject() runtime.Object {
 
 func (t *testObject) GetConditions() []metav1.Condition  { return t.Status.Conditions }
 func (t *testObject) SetConditions(c []metav1.Condition) { t.Status.Conditions = c }
+
+func (t *testObject) GetObservedGeneration() int64        { return t.Status.ObservedGen }
+func (t *testObject) SetObservedGeneration(g int64)       { t.Status.ObservedGen = g }
+func (t *testObject) GetNextReconcileTime() metav1.Time   { return t.Status.NextReconcileTime }
+func (t *testObject) SetNextReconcileTime(ts metav1.Time) { t.Status.NextReconcileTime = ts }
 
 // --- Stub Subroutines ---
 
@@ -821,4 +828,76 @@ func TestSpread_ReconcileWhenDue(t *testing.T) {
 	_, err := lc.Reconcile(context.Background(), newReq("test", "default"))
 	require.NoError(t, err)
 	assert.True(t, processCalled, "subroutine should run when spread says due")
+}
+
+// --- incompatible object type ---
+
+type plainObject struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+}
+
+func (p *plainObject) DeepCopyObject() runtime.Object { cp := *p; return &cp }
+
+func TestWithConditions_PanicsForIncompatibleObject(t *testing.T) {
+	lc := New(nil, "test", func() client.Object { return &plainObject{} })
+	assert.PanicsWithValue(t,
+		`lifecycle "test": object type *lifecycle.plainObject does not implement conditions.ConditionAccessor`,
+		func() { lc.WithConditions(conditions.NewManager()) },
+	)
+}
+
+func TestWithSpread_PanicsForIncompatibleObject(t *testing.T) {
+	lc := New(nil, "test", func() client.Object { return &plainObject{} })
+	assert.PanicsWithValue(t,
+		`lifecycle "test": object type *lifecycle.plainObject does not implement spread.SpreadReconcileStatus`,
+		func() { lc.WithSpread(&fakeSpreadManager{}) },
+	)
+}
+
+func TestSpecPatch_PatchesSpecChanges(t *testing.T) {
+	obj := newTestObj("test", "default")
+	obj.Spec.Value = "original"
+	cl := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(obj).WithStatusSubresource(obj).Build()
+
+	sub := &processorSub{
+		name: "step1",
+		fn: func(_ context.Context, o client.Object) (subroutines.Result, error) {
+			o.(*testObject).Spec.Value = "modified"
+			return subroutines.OK(), nil
+		},
+	}
+
+	lc := setupLifecycle(cl, sub).WithSpecPatch()
+
+	_, err := lc.Reconcile(context.Background(), newReq("test", "default"))
+	require.NoError(t, err)
+
+	fetched := &testObject{}
+	require.NoError(t, cl.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, fetched))
+	assert.Equal(t, "modified", fetched.Spec.Value)
+}
+
+func TestNoSpecPatch_IgnoresSpecChanges(t *testing.T) {
+	obj := newTestObj("test", "default")
+	obj.Spec.Value = "original"
+	cl := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(obj).WithStatusSubresource(obj).Build()
+
+	sub := &processorSub{
+		name: "step1",
+		fn: func(_ context.Context, o client.Object) (subroutines.Result, error) {
+			o.(*testObject).Spec.Value = "modified"
+			return subroutines.OK(), nil
+		},
+	}
+
+	// No WithSpecPatch — spec changes should not be persisted.
+	lc := setupLifecycle(cl, sub)
+
+	_, err := lc.Reconcile(context.Background(), newReq("test", "default"))
+	require.NoError(t, err)
+
+	fetched := &testObject{}
+	require.NoError(t, cl.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, fetched))
+	assert.Equal(t, "original", fetched.Spec.Value)
 }
