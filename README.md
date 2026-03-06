@@ -88,3 +88,5 @@ Please refer to our [Code of Conduct](https://github.com/platform-mesh/.github/b
 ## License
 
 [Apache-2.0](LICENSE)
+
+<p align="center"><img alt="Bundesministerium für Wirtschaft und Energie (BMWE)-EU funding logo" src="https://apeirora.eu/assets/img/BMWK-EU.png" width="400"/></p>
