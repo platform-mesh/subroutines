@@ -105,8 +105,10 @@ func (m *Manager) SetNextReconcileTime(obj client.Object) {
 		return
 	}
 
-	jitterRange := m.maxDuration - m.minDuration
-	jitter := time.Duration(rand.Int64N(int64(jitterRange)))
+	var jitter time.Duration
+	if jitterRange := m.maxDuration - m.minDuration; jitterRange > 0 {
+		jitter = time.Duration(rand.Int64N(int64(jitterRange)))
+	}
 	next := time.Now().Add(m.minDuration + jitter)
 	s.SetNextReconcileTime(metav1.NewTime(next))
 }

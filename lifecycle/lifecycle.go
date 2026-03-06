@@ -329,6 +329,10 @@ func (l *Lifecycle) Reconcile(ctx context.Context, req mcreconcile.Request) (rec
 	if !l.readOnly {
 		patchErr := l.patchChanges(ctx, cl, original, obj)
 		if patchErr != nil {
+			if apierrors.IsConflict(patchErr) {
+				logger.V(1).Info("conflict during patch, requeueing")
+				return reconcile.Result{RequeueAfter: time.Second}, nil
+			}
 			return reconcile.Result{}, errors.Join(subroutineErr, patchErr)
 		}
 	}
@@ -413,8 +417,18 @@ func (l *Lifecycle) patchChanges(ctx context.Context, cl client.Client, original
 		if err := cl.Patch(ctx, current, patch); err != nil {
 			return fmt.Errorf("patching object: %w", err)
 		}
-		// Refresh base so the status patch uses the updated resourceVersion.
-		original = current.DeepCopyObject().(client.Object)
+		// Update resourceVersion on original so the status MergeFrom patch
+		// does not conflict, and recompute unstructured maps so the status
+		// diff comparison accounts for server-side mutations (webhooks, defaults).
+		original.SetResourceVersion(current.GetResourceVersion())
+		origData, err = toUnstructuredMap(original)
+		if err != nil {
+			return fmt.Errorf("converting original to unstructured after patch: %w", err)
+		}
+		currData, err = toUnstructuredMap(current)
+		if err != nil {
+			return fmt.Errorf("converting current to unstructured after patch: %w", err)
+		}
 	}
 
 	// Status patch — skip when the object will be garbage-collected imminently

@@ -25,3 +25,12 @@ type fakeCluster struct {
 }
 
 func (f *fakeCluster) GetClient() client.Client { return f.cl }
+
+type fakeManagerWithError struct {
+	mcmanager.Manager
+	err error
+}
+
+func (f *fakeManagerWithError) ClusterFromContext(context.Context) (cluster.Cluster, error) {
+	return nil, f.err
+}

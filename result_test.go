@@ -67,3 +67,9 @@ func TestResult(t *testing.T) {
 		})
 	}
 }
+
+func TestPending_PanicsOnZeroDuration(t *testing.T) {
+	assert.PanicsWithValue(t, "subroutines: Pending requires a positive requeue duration", func() {
+		Pending(0, "bad")
+	})
+}

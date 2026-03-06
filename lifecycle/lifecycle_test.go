@@ -15,6 +15,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -358,6 +359,12 @@ func TestFinalizeFlow(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, reconcile.Result{}, result)
 	assert.True(t, finalizeCalled)
+
+	// Finalizer should have been removed — with deletionTimestamp set and no
+	// finalizers remaining, the fake client deletes the object.
+	fetched := &testObject{}
+	err = cl.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, fetched)
+	assert.True(t, apierrors.IsNotFound(err), "object should be deleted after finalizer removal")
 }
 
 func TestFinalizeWithRequeue_KeepsFinalizer(t *testing.T) {
@@ -491,9 +498,11 @@ func TestAddFinalizers(t *testing.T) {
 	obj := newTestObj("test", "default")
 	cl := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(obj).WithStatusSubresource(obj).Build()
 
+	processCalled := false
 	sub := &finalizerSub{
 		name: "sub1",
 		processFn: func(context.Context, client.Object) (subroutines.Result, error) {
+			processCalled = true
 			return subroutines.OK(), nil
 		},
 		finalizeFn: func(context.Context, client.Object) (subroutines.Result, error) {
@@ -511,6 +520,9 @@ func TestAddFinalizers(t *testing.T) {
 	fetched := &testObject{}
 	require.NoError(t, cl.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, fetched))
 	assert.Contains(t, fetched.Finalizers, "test.io/sub1")
+
+	// Subroutines should not run on the first reconcile when finalizers are added.
+	assert.False(t, processCalled, "Process should not be called when finalizers are being added")
 }
 
 func TestOKWithRequeue(t *testing.T) {
@@ -900,4 +912,37 @@ func TestNoSpecPatch_IgnoresSpecChanges(t *testing.T) {
 	fetched := &testObject{}
 	require.NoError(t, cl.Get(context.Background(), types.NamespacedName{Name: "test", Namespace: "default"}, fetched))
 	assert.Equal(t, "original", fetched.Spec.Value)
+}
+
+func TestPrepareContext_Error(t *testing.T) {
+	obj := newTestObj("test", "default")
+	cl := fake.NewClientBuilder().WithScheme(newScheme()).WithObjects(obj).WithStatusSubresource(obj).Build()
+
+	processCalled := false
+	sub := &processorSub{
+		name: "step1",
+		fn: func(context.Context, client.Object) (subroutines.Result, error) {
+			processCalled = true
+			return subroutines.OK(), nil
+		},
+	}
+
+	lc := setupLifecycle(cl, sub).
+		WithPrepareContext(func(context.Context, client.Object) (context.Context, error) {
+			return nil, errors.New("context setup failed")
+		})
+
+	_, err := lc.Reconcile(context.Background(), newReq("test", "default"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "preparing context")
+	assert.False(t, processCalled, "subroutines should not run when prepareContext fails")
+}
+
+func TestClusterFromContext_Error(t *testing.T) {
+	mgr := &fakeManagerWithError{err: errors.New("cluster not found")}
+	lc := New(mgr, "test-controller", func() client.Object { return &testObject{} })
+
+	_, err := lc.Reconcile(context.Background(), newReq("test", "default"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "resolving cluster client")
 }

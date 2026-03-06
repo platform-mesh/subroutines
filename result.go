@@ -33,7 +33,11 @@ func OKWithRequeue(d time.Duration) Result {
 // and requeues after d. Use Pending when a subroutine is waiting on an external condition.
 // Note: the lifecycle engine picks the shortest requeue across all subroutines, so a
 // later subroutine returning OKWithRequeue with a shorter duration will take precedence.
+// Panics if d <= 0.
 func Pending(d time.Duration, msg string) Result {
+	if d <= 0 {
+		panic("subroutines: Pending requires a positive requeue duration")
+	}
 	return Result{action: actionPending, requeue: d, message: msg}
 }
 
@@ -47,7 +51,9 @@ func Stop(msg string) Result {
 	return Result{action: actionStop, message: msg}
 }
 
-// IsContinue returns true if the result allows the chain to continue (OK or OKWithRequeue).
+// IsContinue returns true if the result is OK or OKWithRequeue.
+// Note: Pending also continues the chain but returns false here — use IsPending
+// to check for that case separately.
 func (r Result) IsContinue() bool {
 	return r.action == actionContinue
 }

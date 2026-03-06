@@ -132,6 +132,22 @@ func TestSetNextReconcileTime(t *testing.T) {
 	assert.True(t, nrt.Time.Before(maxExpected.Add(5*time.Second)), "next reconcile time should be before max")
 }
 
+func TestSetNextReconcileTime_EqualMinMax(t *testing.T) {
+	mgr := NewManager(
+		WithMinDuration(1*time.Hour),
+		WithMaxDuration(1*time.Hour),
+	)
+
+	obj := newFakeSpreadObject()
+	mgr.SetNextReconcileTime(obj)
+
+	nrt := obj.GetNextReconcileTime()
+	assert.False(t, nrt.IsZero())
+
+	expected := time.Now().Add(1 * time.Hour)
+	assert.InDelta(t, float64(expected.UnixMilli()), float64(nrt.UnixMilli()), float64(5*time.Second/time.Millisecond))
+}
+
 func TestUpdateObservedGeneration(t *testing.T) {
 	mgr := NewManager()
 	obj := newFakeSpreadObject()
