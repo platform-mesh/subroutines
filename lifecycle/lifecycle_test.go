@@ -203,7 +203,7 @@ func TestProcessorError_StopsChain(t *testing.T) {
 	reporter := &fakeErrorReporter{}
 	lc := setupLifecycle(cl, sub1, sub2).
 		WithConditions(conditions.NewManager()).
-		WithErrorReporter(reporter)
+		WithErrorReporters(reporter)
 
 	_, err := lc.Reconcile(context.Background(), newReq("test", "default"))
 	require.Error(t, err)
@@ -215,7 +215,7 @@ func TestProcessorError_StopsChain(t *testing.T) {
 	// Error reporter should have been called.
 	require.Len(t, reporter.reported, 1)
 	assert.Equal(t, "step1", reporter.reported[0].Subroutine)
-	assert.Equal(t, "process", reporter.reported[0].Action)
+	assert.Equal(t, ActionProcess, reporter.reported[0].Action)
 }
 
 func TestStopWithRequeue_BreaksChain(t *testing.T) {
@@ -480,7 +480,7 @@ func TestErrorReporter_NotCalledOnStop(t *testing.T) {
 	}
 
 	reporter := &fakeErrorReporter{}
-	lc := setupLifecycle(cl, sub).WithErrorReporter(reporter)
+	lc := setupLifecycle(cl, sub).WithErrorReporters(reporter)
 
 	_, err := lc.Reconcile(context.Background(), newReq("test", "default"))
 	require.NoError(t, err)

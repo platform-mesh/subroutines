@@ -9,9 +9,9 @@ import (
 
 // ConditionManager manages per-subroutine and aggregate conditions.
 type ConditionManager interface {
-	InitUnknownConditions(obj client.Object, subroutineNames []string, generation int64)
-	SetSubroutineCondition(obj client.Object, name string, result subroutines.Result, err error, isFinalize bool, generation int64)
-	SetReadyCondition(obj client.Object, hasErrors bool, hasPending bool, hasStopped bool, generation int64)
+	InitUnknownConditions(obj client.Object, subroutineNames []string)
+	SetSubroutineCondition(obj client.Object, name string, result subroutines.Result, err error, isFinalize bool)
+	SetReadyCondition(obj client.Object, reason string)
 }
 
 // SpreadManager manages reconciliation spreading.

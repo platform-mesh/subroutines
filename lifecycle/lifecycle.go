@@ -85,9 +85,9 @@ func (l *Lifecycle) WithSpread(sm SpreadManager) *Lifecycle {
 	return l
 }
 
-// WithErrorReporter adds an error reporter.
-func (l *Lifecycle) WithErrorReporter(r ErrorReporter) *Lifecycle {
-	l.errorReporters = append(l.errorReporters, r)
+// WithErrorReporters adds one or more error reporters.
+func (l *Lifecycle) WithErrorReporters(reporters ...ErrorReporter) *Lifecycle {
+	l.errorReporters = append(l.errorReporters, reporters...)
 	return l
 }
 
@@ -109,13 +109,19 @@ func (l *Lifecycle) WithSpecPatch() *Lifecycle {
 	return l
 }
 
-// WithInitializer sets the initializer name to look for in status.
+// WithInitializer enables initializer support. When the given name is present in
+// status.initializers (set by kcp), subroutines implementing Initializer will run
+// Initialize instead of Process. The marker is removed from status once all
+// subroutines complete successfully.
 func (l *Lifecycle) WithInitializer(name string) *Lifecycle {
 	l.initializer = name
 	return l
 }
 
-// WithTerminator sets the terminator name to look for in status.
+// WithTerminator enables terminator support. When the given name is present in
+// status.terminators (set by kcp), subroutines implementing Terminator will run
+// Terminate instead of Finalize during deletion. The marker is removed from status
+// once all subroutines complete successfully.
 func (l *Lifecycle) WithTerminator(name string) *Lifecycle {
 	l.terminator = name
 	return l
@@ -172,13 +178,16 @@ func (l *Lifecycle) Reconcile(ctx context.Context, req mcreconcile.Request) (rec
 		}
 	}
 
-	// Add finalizers.
+	// Add finalizers — if any were added, stop and let the watch event trigger the next reconciliation.
 	if !isDeleting && !l.readOnly {
-		if err := l.addFinalizers(ctx, cl, obj); err != nil {
+		added, err := l.addFinalizers(ctx, cl, obj)
+		if err != nil {
 			return reconcile.Result{}, fmt.Errorf("adding finalizers: %w", err)
 		}
-		// Re-read the original after finalizer patch to avoid stale data.
-		original = obj.DeepCopyObject().(client.Object)
+		if added {
+			logger.V(1).Info("finalizers added, waiting for next reconciliation")
+			return reconcile.Result{}, nil
+		}
 	}
 
 	// Prepare context.
@@ -195,7 +204,7 @@ func (l *Lifecycle) Reconcile(ctx context.Context, req mcreconcile.Request) (rec
 		subNames = append(subNames, sub.GetName())
 	}
 	if l.conditions != nil {
-		l.conditions.InitUnknownConditions(obj, subNames, generation)
+		l.conditions.InitUnknownConditions(obj, subNames)
 	}
 
 	// Build execution order.
@@ -219,7 +228,7 @@ func (l *Lifecycle) Reconcile(ctx context.Context, req mcreconcile.Request) (rec
 		}
 
 		subCtx, subSpan := tracer.Start(ctx, fmt.Sprintf("%s/%s/%s", l.controllerName, sub.GetName(), actionName),
-			trace.WithAttributes(attribute.String("subroutine", sub.GetName()), attribute.String("action", actionName)),
+			trace.WithAttributes(attribute.String("subroutine", sub.GetName()), attribute.String("action", actionName.String())),
 		)
 
 		start := time.Now()
@@ -227,13 +236,12 @@ func (l *Lifecycle) Reconcile(ctx context.Context, req mcreconcile.Request) (rec
 		duration := time.Since(start)
 		subSpan.End()
 
-		subroutinemetrics.Record(l.controllerName, sub.GetName(), actionName, result, err, duration)
-		isFinalize := actionName == "finalize" || actionName == "terminate"
+		subroutinemetrics.Record(l.controllerName, sub.GetName(), actionName.String(), result, err, duration)
 
 		if err != nil {
 			logger.Error(err, "subroutine failed", "subroutine", sub.GetName(), "action", actionName)
 			if l.conditions != nil {
-				l.conditions.SetSubroutineCondition(obj, sub.GetName(), result, err, isFinalize, generation)
+				l.conditions.SetSubroutineCondition(obj, sub.GetName(), result, err, actionName.IsFinalize())
 			}
 			for _, reporter := range l.errorReporters {
 				reporter.Report(ctx, err, ErrorInfo{
@@ -247,7 +255,7 @@ func (l *Lifecycle) Reconcile(ctx context.Context, req mcreconcile.Request) (rec
 		}
 
 		if l.conditions != nil {
-			l.conditions.SetSubroutineCondition(obj, sub.GetName(), result, nil, isFinalize, generation)
+			l.conditions.SetSubroutineCondition(obj, sub.GetName(), result, nil, actionName.IsFinalize())
 		}
 
 		// Track min requeue across all subroutines — the shortest duration wins
@@ -259,7 +267,7 @@ func (l *Lifecycle) Reconcile(ctx context.Context, req mcreconcile.Request) (rec
 		}
 
 		// Remove finalizers after successful finalize with no requeue.
-		if actionName == "finalize" && result.IsContinue() && result.Requeue() == 0 {
+		if actionName == ActionFinalize && result.IsContinue() && result.Requeue() == 0 {
 			if finalizer, ok := sub.(subroutines.Finalizer); ok {
 				for _, f := range finalizer.Finalizers(obj) {
 					controllerutil.RemoveFinalizer(obj, f)
@@ -294,7 +302,18 @@ func (l *Lifecycle) Reconcile(ctx context.Context, req mcreconcile.Request) (rec
 
 	// Set Ready condition.
 	if l.conditions != nil {
-		l.conditions.SetReadyCondition(obj, subroutineErr != nil, hasPending, hasStopped, generation)
+		var readyReason string
+		switch {
+		case subroutineErr != nil:
+			readyReason = conditions.ReasonError
+		case hasStopped:
+			readyReason = conditions.ReasonStopped
+		case hasPending:
+			readyReason = conditions.ReasonPending
+		default:
+			readyReason = conditions.ReasonComplete
+		}
+		l.conditions.SetReadyCondition(obj, readyReason)
 	}
 
 	// Update spread state.
@@ -319,18 +338,18 @@ func (l *Lifecycle) Reconcile(ctx context.Context, req mcreconcile.Request) (rec
 
 type actionFunc func(ctx context.Context, obj client.Object) (subroutines.Result, error)
 
-func (l *Lifecycle) resolveAction(ctx context.Context, sub subroutines.Subroutine, obj client.Object, isDeleting bool) (actionFunc, string) {
+func (l *Lifecycle) resolveAction(ctx context.Context, sub subroutines.Subroutine, obj client.Object, isDeleting bool) (actionFunc, Action) {
 	if isDeleting {
 		// Terminator takes precedence when configured and marker is in status.
 		if l.terminator != "" && hasMarkerInStatus(ctx, obj, statusFieldTerminators, l.terminator) {
 			if t, ok := sub.(subroutines.Terminator); ok {
-				return t.Terminate, "terminate"
+				return t.Terminate, ActionTerminate
 			}
 		}
 		// Finalizer.
 		if f, ok := sub.(subroutines.Finalizer); ok {
 			if hasAnyFinalizer(obj, f.Finalizers(obj)) {
-				return f.Finalize, "finalize"
+				return f.Finalize, ActionFinalize
 			}
 		}
 		return nil, ""
@@ -339,17 +358,17 @@ func (l *Lifecycle) resolveAction(ctx context.Context, sub subroutines.Subroutin
 	// Initializer takes precedence when configured and marker is in status.
 	if l.initializer != "" && hasMarkerInStatus(ctx, obj, statusFieldInitializers, l.initializer) {
 		if i, ok := sub.(subroutines.Initializer); ok {
-			return i.Initialize, "initialize"
+			return i.Initialize, ActionInitialize
 		}
 	}
 	// Processor.
 	if p, ok := sub.(subroutines.Processor); ok {
-		return p.Process, "process"
+		return p.Process, ActionProcess
 	}
 	return nil, ""
 }
 
-func (l *Lifecycle) addFinalizers(ctx context.Context, cl client.Client, obj client.Object) error {
+func (l *Lifecycle) addFinalizers(ctx context.Context, cl client.Client, obj client.Object) (bool, error) {
 	var missing []string
 	current := obj.GetFinalizers()
 	for _, sub := range l.subroutines {
@@ -364,11 +383,11 @@ func (l *Lifecycle) addFinalizers(ctx context.Context, cl client.Client, obj cli
 		}
 	}
 	if len(missing) == 0 {
-		return nil
+		return false, nil
 	}
 	patch := client.MergeFrom(obj.DeepCopyObject().(client.Object))
 	obj.SetFinalizers(append(current, missing...))
-	return cl.Patch(ctx, obj, patch)
+	return true, cl.Patch(ctx, obj, patch)
 }
 
 func (l *Lifecycle) patchChanges(ctx context.Context, cl client.Client, original, current client.Object) error {

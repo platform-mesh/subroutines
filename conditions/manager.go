@@ -31,12 +31,13 @@ func NewManager() *Manager {
 
 // InitUnknownConditions sets per-subroutine and Ready conditions to Unknown
 // if they are not already present.
-func (m *Manager) InitUnknownConditions(obj client.Object, subroutineNames []string, generation int64) {
+func (m *Manager) InitUnknownConditions(obj client.Object, subroutineNames []string) {
 	accessor, ok := obj.(ConditionAccessor)
 	if !ok {
 		return
 	}
 
+	generation := obj.GetGeneration()
 	for _, name := range subroutineNames {
 		m.ensureCondition(accessor, name, generation)
 	}
@@ -44,7 +45,8 @@ func (m *Manager) InitUnknownConditions(obj client.Object, subroutineNames []str
 }
 
 // SetSubroutineCondition maps a subroutine result/error to a condition on the object.
-func (m *Manager) SetSubroutineCondition(obj client.Object, name string, result subroutines.Result, err error, isFinalize bool, generation int64) {
+// The action determines the condition name suffix (finalize/terminate actions append "Finalize").
+func (m *Manager) SetSubroutineCondition(obj client.Object, name string, result subroutines.Result, err error, isFinalize bool) {
 	accessor, ok := obj.(ConditionAccessor)
 	if !ok {
 		return
@@ -57,7 +59,7 @@ func (m *Manager) SetSubroutineCondition(obj client.Object, name string, result 
 
 	cond := metav1.Condition{
 		Type:               condName,
-		ObservedGeneration: generation,
+		ObservedGeneration: obj.GetGeneration(),
 	}
 
 	switch {
@@ -84,8 +86,9 @@ func (m *Manager) SetSubroutineCondition(obj client.Object, name string, result 
 	accessor.SetConditions(conditions)
 }
 
-// SetReadyCondition sets the aggregate Ready condition based on subroutine outcomes.
-func (m *Manager) SetReadyCondition(obj client.Object, hasErrors bool, hasPending bool, hasStopped bool, generation int64) {
+// SetReadyCondition sets the aggregate Ready condition based on the given reason.
+// The reason must be one of ReasonComplete, ReasonError, ReasonPending, or ReasonStopped.
+func (m *Manager) SetReadyCondition(obj client.Object, reason string) {
 	accessor, ok := obj.(ConditionAccessor)
 	if !ok {
 		return
@@ -93,25 +96,22 @@ func (m *Manager) SetReadyCondition(obj client.Object, hasErrors bool, hasPendin
 
 	cond := metav1.Condition{
 		Type:               ReadyCondition,
-		ObservedGeneration: generation,
+		ObservedGeneration: obj.GetGeneration(),
+		Reason:             reason,
 	}
 
-	switch {
-	case hasErrors:
+	switch reason {
+	case ReasonError:
 		cond.Status = metav1.ConditionFalse
-		cond.Reason = ReasonError
 		cond.Message = "one or more subroutines encountered an error"
-	case hasStopped:
+	case ReasonStopped:
 		cond.Status = metav1.ConditionFalse
-		cond.Reason = ReasonStopped
 		cond.Message = "one or more subroutines stopped the chain"
-	case hasPending:
+	case ReasonPending:
 		cond.Status = metav1.ConditionUnknown
-		cond.Reason = ReasonPending
 		cond.Message = "one or more subroutines are pending"
 	default:
 		cond.Status = metav1.ConditionTrue
-		cond.Reason = ReasonComplete
 		cond.Message = "all subroutines completed successfully"
 	}
 

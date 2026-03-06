@@ -28,8 +28,8 @@ func (f *fakeConditionObject) SetConditions(c []metav1.Condition) { f.conditions
 
 func TestInitUnknownConditions(t *testing.T) {
 	mgr := NewManager()
-	obj := &fakeConditionObject{}
-	mgr.InitUnknownConditions(obj, []string{"sub1", "sub2"}, 1)
+	obj := &fakeConditionObject{ObjectMeta: metav1.ObjectMeta{Generation: 1}}
+	mgr.InitUnknownConditions(obj, []string{"sub1", "sub2"})
 
 	require.Len(t, obj.conditions, 3) // sub1, sub2, Ready
 	for _, name := range []string{"sub1", "sub2", ReadyCondition} {
@@ -42,7 +42,7 @@ func TestInitUnknownConditions(t *testing.T) {
 
 	// Calling again should not overwrite existing conditions.
 	obj.conditions[0].Status = metav1.ConditionTrue
-	mgr.InitUnknownConditions(obj, []string{"sub1", "sub2"}, 2)
+	mgr.InitUnknownConditions(obj, []string{"sub1", "sub2"})
 	assert.Equal(t, metav1.ConditionTrue, obj.conditions[0].Status)
 }
 
@@ -112,8 +112,8 @@ func TestSetSubroutineCondition(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			mgr := NewManager()
-			obj := &fakeConditionObject{}
-			mgr.SetSubroutineCondition(obj, "mysub", tt.result, tt.err, tt.isFinalize, 1)
+			obj := &fakeConditionObject{ObjectMeta: metav1.ObjectMeta{Generation: 1}}
+			mgr.SetSubroutineCondition(obj, "mysub", tt.result, tt.err, tt.isFinalize)
 
 			c := meta.FindStatusCondition(obj.conditions, tt.wantType)
 			require.NotNil(t, c)
@@ -126,49 +126,41 @@ func TestSetSubroutineCondition(t *testing.T) {
 func TestSetReadyCondition(t *testing.T) {
 	tests := []struct {
 		name       string
-		hasErrors  bool
-		hasPending bool
-		hasStopped bool
+		reason     string
 		wantStatus metav1.ConditionStatus
 		wantReason string
 	}{
 		{
 			name:       "all OK",
+			reason:     ReasonComplete,
 			wantStatus: metav1.ConditionTrue,
 			wantReason: ReasonComplete,
 		},
 		{
 			name:       "has errors",
-			hasErrors:  true,
+			reason:     ReasonError,
 			wantStatus: metav1.ConditionFalse,
 			wantReason: ReasonError,
 		},
 		{
 			name:       "has stopped",
-			hasStopped: true,
+			reason:     ReasonStopped,
 			wantStatus: metav1.ConditionFalse,
 			wantReason: ReasonStopped,
 		},
 		{
 			name:       "has pending",
-			hasPending: true,
+			reason:     ReasonPending,
 			wantStatus: metav1.ConditionUnknown,
 			wantReason: ReasonPending,
-		},
-		{
-			name:       "errors take precedence over pending",
-			hasErrors:  true,
-			hasPending: true,
-			wantStatus: metav1.ConditionFalse,
-			wantReason: ReasonError,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			mgr := NewManager()
-			obj := &fakeConditionObject{}
-			mgr.SetReadyCondition(obj, tt.hasErrors, tt.hasPending, tt.hasStopped, 1)
+			obj := &fakeConditionObject{ObjectMeta: metav1.ObjectMeta{Generation: 1}}
+			mgr.SetReadyCondition(obj, tt.reason)
 
 			c := meta.FindStatusCondition(obj.conditions, ReadyCondition)
 			require.NotNil(t, c)
