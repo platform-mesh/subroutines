@@ -449,11 +449,7 @@ func (l *Lifecycle) patchChanges(ctx context.Context, cl client.Client, original
 }
 
 func toUnstructuredMap(obj client.Object) (map[string]any, error) {
-	data, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
-	if err != nil {
-		return nil, err
-	}
-	return data, nil
+	return runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
 }
 
 func getMap(data map[string]any, key string) map[string]any {

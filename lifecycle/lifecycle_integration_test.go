@@ -14,8 +14,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -105,5 +106,5 @@ func TestIntegration_FullLifecycle(t *testing.T) {
 
 	// Object should be gone (finalizer removed, k8s deletes it).
 	err = cl.Get(context.Background(), types.NamespacedName{Name: "integration-test", Namespace: "default"}, fetched)
-	assert.True(t, client.IgnoreNotFound(err) == nil, "object should be deleted")
+	assert.True(t, apierrors.IsNotFound(err), "object should be deleted after finalizer removal")
 }

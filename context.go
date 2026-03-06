@@ -23,7 +23,8 @@ func ClientFromContext(ctx context.Context) (client.Client, error) {
 	return cl, nil
 }
 
-// MustClientFromContext retrieves the client.Client from the context or panics.
+// MustClientFromContext retrieves the client.Client from the context.
+// It panics if no client is stored in the context.
 func MustClientFromContext(ctx context.Context) client.Client {
 	cl, err := ClientFromContext(ctx)
 	if err != nil {
