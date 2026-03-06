@@ -25,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/util/workqueue"
 )
 
 var tracer = otel.Tracer("github.com/platform-mesh/subroutines/lifecycle")
@@ -51,6 +52,7 @@ type Lifecycle struct {
 	specPatch      bool
 	initializer    string
 	terminator     string
+	rateLimiter    workqueue.TypedRateLimiter[reconcile.Request]
 }
 
 // New creates a Lifecycle for the given controller.
@@ -125,6 +127,20 @@ func (l *Lifecycle) WithInitializer(name string) *Lifecycle {
 func (l *Lifecycle) WithTerminator(name string) *Lifecycle {
 	l.terminator = name
 	return l
+}
+
+// WithRateLimiter sets a custom rate limiter for the controller's work queue.
+// This controls how fast items re-enter the queue, independent of subroutine-level
+// requeue timing. Accepts any workqueue.TypedRateLimiter implementation.
+func (l *Lifecycle) WithRateLimiter(limiter workqueue.TypedRateLimiter[reconcile.Request]) *Lifecycle {
+	l.rateLimiter = limiter
+	return l
+}
+
+// RateLimiter returns the configured rate limiter, or nil if none was set.
+// This is used by controller setup code to configure the controller's work queue.
+func (l *Lifecycle) RateLimiter() workqueue.TypedRateLimiter[reconcile.Request] {
+	return l.rateLimiter
 }
 
 // Reconcile implements mcreconcile.Reconciler.
