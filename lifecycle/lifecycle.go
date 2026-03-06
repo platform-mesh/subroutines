@@ -25,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/util/workqueue"
 )
 
 var tracer = otel.Tracer("github.com/platform-mesh/subroutines/lifecycle")
@@ -51,6 +52,7 @@ type Lifecycle struct {
 	specPatch      bool
 	initializer    string
 	terminator     string
+	rateLimiter    workqueue.TypedRateLimiter[reconcile.Request]
 }
 
 // New creates a Lifecycle for the given controller.
@@ -125,6 +127,20 @@ func (l *Lifecycle) WithInitializer(name string) *Lifecycle {
 func (l *Lifecycle) WithTerminator(name string) *Lifecycle {
 	l.terminator = name
 	return l
+}
+
+// WithRateLimiter sets a custom rate limiter for the controller's work queue.
+// This controls how fast items re-enter the queue, independent of subroutine-level
+// requeue timing. Accepts any workqueue.TypedRateLimiter implementation.
+func (l *Lifecycle) WithRateLimiter(limiter workqueue.TypedRateLimiter[reconcile.Request]) *Lifecycle {
+	l.rateLimiter = limiter
+	return l
+}
+
+// RateLimiter returns the configured rate limiter, or nil if none was set.
+// This is used by controller setup code to configure the controller's work queue.
+func (l *Lifecycle) RateLimiter() workqueue.TypedRateLimiter[reconcile.Request] {
+	return l.rateLimiter
 }
 
 // Reconcile implements mcreconcile.Reconciler.
@@ -218,10 +234,12 @@ func (l *Lifecycle) Reconcile(ctx context.Context, req mcreconcile.Request) (rec
 		subroutineErr error
 		hasPending    bool
 		hasStopped    bool
+		hasSkipAll    bool
+		skipAllReady  bool
 		minRequeue    time.Duration
 	)
 
-	for _, sub := range subs {
+	for i, sub := range subs {
 		action, actionName := l.resolveAction(ctx, sub, obj, isDeleting)
 		if action == nil {
 			continue
@@ -284,10 +302,27 @@ func (l *Lifecycle) Reconcile(ctx context.Context, req mcreconcile.Request) (rec
 			logger.Info("subroutine stopped the chain", "subroutine", sub.GetName(), "action", actionName, "message", result.Message())
 			break
 		}
+
+		if result.IsSkipAll() {
+			hasSkipAll = true
+			skipAllReady = result.Ready()
+			logger.Info("subroutine skipped remaining chain", "subroutine", sub.GetName(), "action", actionName, "message", result.Message(), "ready", result.Ready())
+			// Set remaining subroutines' conditions to Skipped.
+			if l.conditions != nil {
+				var remaining []string
+				for _, r := range subs[i+1:] {
+					remaining = append(remaining, r.GetName())
+				}
+				if len(remaining) > 0 {
+					l.conditions.SetSkippedConditions(obj, remaining, skipAllReady, result.Message())
+				}
+			}
+			break
+		}
 	}
 
 	// Remove initializer/terminator from status if all succeeded with no requeue.
-	if subroutineErr == nil && !hasStopped && !hasPending && minRequeue == 0 {
+	if subroutineErr == nil && !hasStopped && !hasSkipAll && !hasPending && minRequeue == 0 {
 		if l.initializer != "" && !isDeleting {
 			if removeMarkerFromStatus(ctx, obj, statusFieldInitializers, l.initializer) {
 				logger.V(1).Info("removed initializer from status", "initializer", l.initializer)
@@ -307,6 +342,8 @@ func (l *Lifecycle) Reconcile(ctx context.Context, req mcreconcile.Request) (rec
 		case subroutineErr != nil:
 			readyReason = conditions.ReasonError
 		case hasStopped:
+			readyReason = conditions.ReasonStopped
+		case hasSkipAll && !skipAllReady:
 			readyReason = conditions.ReasonStopped
 		case hasPending:
 			readyReason = conditions.ReasonPending
