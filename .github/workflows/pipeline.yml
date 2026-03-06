@@ -10,7 +10,6 @@ on:
 
 jobs:
   pipe:
-    timeout-minutes: 15
     concurrency:
       group: ${{ github.workflow }}-${{ github.ref }}
       cancel-in-progress: true
