@@ -18,8 +18,8 @@ tasks:
   cover:
     desc: Run tests with coverage
     cmds:
-      - go test -count=1 -short -coverprofile=coverage.out ./...
-      - go tool cover -func=coverage.out
+      - go test -count=1 -short -coverprofile=cover.out -covermode=atomic -coverpkg=./... ./...
+      - go tool cover -func=cover.out
 
   validate:
     desc: Run lint and tests
