@@ -1,6 +1,6 @@
 module github.com/platform-mesh/subroutines
 
-go 1.26.0
+go 1.26.3
 
 require (
 	github.com/prometheus/client_golang v1.23.2
@@ -9,7 +9,7 @@ require (
 	go.opentelemetry.io/otel/trace v1.43.0
 	k8s.io/apimachinery v0.36.1
 	sigs.k8s.io/controller-runtime v0.24.1
-	sigs.k8s.io/multicluster-runtime v0.23.3
+	sigs.k8s.io/multicluster-runtime v0.24.1
 )
 
 require (
