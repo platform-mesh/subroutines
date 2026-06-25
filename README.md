@@ -1,3 +1,7 @@
+> [!WARNING]
+> Development of subroutines moved to [github.com/platform-mesh/platfrom-mesh]
+> New import path for future versions: `go.platform-mesh.io/subroutines` `v0.6.0`
+
 # Platform Mesh - subroutines
 
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/platform-mesh/subroutines/badge)](https://scorecard.dev/viewer/?uri=github.com/platform-mesh/subroutines)
